@@ -59,6 +59,7 @@ from .block import (
     ResNetLayer,
     SCDown,
     TorchVision,
+    DualAttentionBlock,
 )
 from .conv import (
     CBAM,
@@ -187,4 +188,6 @@ __all__ = (
     "YOLOESegment",
     "YOLOESegment26",
     "v10Detect",
+    "DualAttentionBlock",
+    "TEGMA",
 )

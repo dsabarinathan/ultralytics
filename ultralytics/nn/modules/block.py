@@ -2065,3 +2065,277 @@ class RealNVP(nn.Module):
             self.float()
         z, log_det = self.backward_p(x)
         return self.prior.log_prob(z) + log_det
+
+
+# ── add to __all__ tuple ──────────────────────────────────────────────────────
+# "DualAttentionBlock",
+
+
+# ── append at the bottom of the file ─────────────────────────────────────────
+import torch
+import torch.nn as nn
+from .conv import Conv
+
+
+class PositionAttentionModule(nn.Module):
+    """
+    Position Attention Module (PAM) for spatial context aggregation.
+    Captures long-range spatial dependencies via self-attention on flattened feature maps.
+    """
+
+    def __init__(self, in_channels):
+        super().__init__()
+        self.in_channels = in_channels
+        self.inter_channels = max(in_channels // 8, 1)
+
+        self.query_conv = nn.Conv2d(in_channels, self.inter_channels, kernel_size=1)
+        self.key_conv   = nn.Conv2d(in_channels, self.inter_channels, kernel_size=1)
+        self.value_conv = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+
+        self.gamma   = nn.Parameter(torch.zeros(1))
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, x):
+        B, C, H, W = x.size()
+        N = H * W
+
+        proj_query = self.query_conv(x).view(B, self.inter_channels, N).permute(0, 2, 1)  # (B,N,C')
+        proj_key   = self.key_conv(x).view(B, self.inter_channels, N)                      # (B,C',N)
+        energy     = torch.bmm(proj_query, proj_key)                                        # (B,N,N)
+        attention  = self.softmax(energy)
+
+        proj_value = self.value_conv(x).view(B, C, N)                                      # (B,C,N)
+        out = torch.bmm(proj_value, attention.permute(0, 2, 1))                            # (B,C,N)
+        out = out.view(B, C, H, W)
+        return self.gamma * out + x
+
+
+class ChannelAttentionModule(nn.Module):
+    """
+    Channel Attention Module (CAM) for semantic interdependency mapping.
+    Models cross-channel relationships via channel-wise self-attention.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.gamma   = nn.Parameter(torch.zeros(1))
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, x):
+        B, C, H, W = x.size()
+        N = H * W
+
+        proj_query = x.view(B, C, N)                        # (B,C,N)
+        proj_key   = x.view(B, C, N).permute(0, 2, 1)       # (B,N,C)
+        energy     = torch.bmm(proj_query, proj_key)         # (B,C,C)
+
+        # Numerical stability: subtract row-wise max before softmax
+        energy_new = torch.max(energy, dim=-1, keepdim=True)[0].expand_as(energy) - energy
+        attention  = self.softmax(energy_new)
+
+        proj_value = x.view(B, C, N)                        # (B,C,N)
+        out = torch.bmm(attention, proj_value)               # (B,C,N)
+        out = out.view(B, C, H, W)
+        return self.gamma * out + x
+
+
+class DualAttentionBlock(nn.Module):
+    """
+    Dual Attention Block (DAB) for YOLOv11 integration.
+
+    Combines Position Attention Module (PAM) and Channel Attention Module (CAM)
+    in parallel to produce a globally-aware feature representation.
+
+    Args:
+        c1 (int): Number of input channels.
+        c2 (int | None): Number of output channels. Defaults to c1 if not specified.
+        shortcut (bool): API-compatibility placeholder (unused internally).
+    """
+
+    def __init__(self, c1, c2=None, shortcut=True):  # ← c2 now optional
+        super().__init__()
+        if c2 is None:          # ← fall back to identity mapping
+            c2 = c1
+        self.cv1 = Conv(c1, c2, 1, 1) if c1 != c2 else nn.Identity()
+        self.pam = PositionAttentionModule(c2)
+        self.cam = ChannelAttentionModule()
+        self.cv2 = Conv(c2, c2, 3, 1)
+
+    def forward(self, x):
+        x_aligned = self.cv1(x)
+        return self.cv2(self.pam(x_aligned) + self.cam(x_aligned))
+
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  TEGMA — Thermal Edge-Guided Modulation Attention                          ║
+# ║  A novel lightweight attention module for thermal object detection          ║
+# ║  Designed for YOLOv11 + FLIR thermal imagery + edge deployment             ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+#
+# INSTALLATION:
+#   Append this entire file's contents to the BOTTOM of:
+#   <your_ultralytics_path>/ultralytics/nn/modules/block.py
+#
+# IMPORTANT: Make sure these imports exist at the top of block.py:
+#   import torch
+#   import torch.nn as nn
+#   (they likely already do)
+#
+# The Conv import from .conv should also already exist in block.py.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class MultiScaleThermalEdge(nn.Module):
+    """
+    Multi-Scale Thermal Edge Extraction Branch.
+
+    Applies parallel depthwise convolutions at two scales (3×3 for fine edges,
+    7×7 for coarse thermal gradients), computes absolute edge magnitude, and
+    normalizes with GroupNorm + SiLU.
+
+    Physics rationale:
+        Thermal images are inherently low-texture. Object boundaries create sharp
+        intensity gradients from temperature differentials (e.g., warm okra pod
+        vs. cooler leaf). Both warming→cooling and cooling→warming transitions
+        are informative, so absolute value captures both gradient directions.
+        Two scales capture fine object boundaries (3×3) and broader thermal
+        transition zones (7×7).
+
+    Args:
+        c (int): Number of input/output channels.
+    """
+
+    def __init__(self, c):
+        super().__init__()
+        # Fine-scale edge detector (3×3 depthwise conv)
+        self.dw_fine = nn.Conv2d(c, c, kernel_size=3, padding=1, groups=c, bias=False)
+        # Coarse-scale thermal gradient detector (7×7 depthwise conv)
+        self.dw_coarse = nn.Conv2d(c, c, kernel_size=7, padding=3, groups=c, bias=False)
+        # GroupNorm with groups=C acts as instance-like normalization per channel
+        self.norm = nn.GroupNorm(num_groups=c, num_channels=c)
+        self.act = nn.SiLU(inplace=True)
+
+    def forward(self, x):
+        # Parallel multi-scale edge extraction
+        e_fine = self.dw_fine(x)      # Fine thermal edges
+        e_coarse = self.dw_coarse(x)  # Coarse thermal gradients
+        # Absolute value: captures both positive and negative gradient directions
+        # Critical for thermal where warming-to-cooling AND cooling-to-warming
+        # transitions at object boundaries are both informative
+        e = torch.abs(e_fine) + torch.abs(e_coarse)
+        return self.act(self.norm(e))
+
+
+class FrequencyAwareChannelGate(nn.Module):
+    """
+    Frequency-Aware Channel Gate.
+
+    Lightweight ECA-style channel attention that learns to distinguish
+    between genuine thermal edge features and noise-induced edge artifacts.
+
+    Physics rationale:
+        Uncooled microbolometers (FLIR) exhibit fixed-pattern noise and
+        NETD of 20-80 mK. Edge extraction amplifies this noise alongside
+        genuine thermal boundaries. The channel gate learns which feature
+        channels carry genuine thermal structure vs. noise-induced edges,
+        effectively acting as a learned frequency-domain filter.
+
+    Args:
+        c (int): Number of input channels.
+        kernel_size (int): 1D conv kernel size for cross-channel interaction.
+    """
+
+    def __init__(self, c, kernel_size=3):
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        # 1D conv across channels (ECA-style, no FC layers)
+        # Padding ensures output length matches input
+        self.conv = nn.Conv1d(
+            1, 1,
+            kernel_size=kernel_size,
+            padding=kernel_size // 2,
+            bias=False
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        # Global average pool: (B, C, H, W) → (B, C, 1, 1)
+        y = self.pool(x)
+        # Reshape for 1D conv: (B, C, 1, 1) → (B, 1, C)
+        y = y.squeeze(-1).transpose(-1, -2)
+        # Cross-channel 1D convolution
+        y = self.conv(y)
+        # Back to channel weights: (B, 1, C) → (B, C, 1, 1)
+        y = y.transpose(-1, -2).unsqueeze(-1)
+        return self.sigmoid(y)
+
+
+class TEGMA(nn.Module):
+    """
+    Thermal Edge-Guided Modulation Attention (TEGMA).
+
+    A novel lightweight attention module that encodes thermal imaging physics
+    directly into the attention computation, rather than applying generic
+    RGB-designed attention to thermal data.
+
+    Design principle:
+        Thermal images are low-texture with discriminative information
+        concentrated at edges (temperature boundaries). TEGMA replaces the
+        generic context branch of modulation-based attention (EfficientMod,
+        ICLR 2024) with an explicit multi-scale thermal edge extraction
+        pathway, combined with a frequency-aware channel gate for noise
+        suppression. The edge-guided modulation amplifies features at thermal
+        boundaries while suppressing smooth interior regions.
+
+    Pipeline:
+        1. Multi-Scale Thermal Edge Branch: DWConv 3×3 + DWConv 7×7 → |·| → GroupNorm → SiLU
+        2. Feature Projection Branch: Conv 1×1
+        3. Edge-Guided Modulation: E ⊙ P (element-wise multiply)
+        4. Frequency-Aware Channel Gate: GAP → Conv1D → Sigmoid → channel weights
+        5. Output: X + W_ch ⊙ F_mod (gated residual)
+
+    Args:
+        c1 (int): Number of input channels.
+        c2 (int): Number of output channels. Defaults to c1 if None.
+
+    Parameter count (C=64):  ~7,939 params
+    Parameter count (C=128): ~22K params
+    Parameter count (C=256): ~75K params
+    """
+
+    def __init__(self, c1, c2=None):
+        super().__init__()
+        c2 = c2 or c1
+
+        # Channel alignment if c1 != c2
+        self.align = Conv(c1, c2, 1) if c1 != c2 else nn.Identity()
+
+        # Branch 1: Multi-scale thermal edge extraction
+        self.edge = MultiScaleThermalEdge(c2)
+
+        # Branch 2: Feature projection (1×1 pointwise conv)
+        self.proj = nn.Conv2d(c2, c2, kernel_size=1, bias=False)
+
+        # Channel gate: frequency-aware noise suppression
+        self.gate = FrequencyAwareChannelGate(c2, kernel_size=3)
+
+    def forward(self, x):
+        x = self.align(x)
+
+        # Multi-scale thermal edge features
+        e = self.edge(x)           # (B, C, H, W) — edge magnitudes
+
+        # Feature projection
+        p = self.proj(x)           # (B, C, H, W) — projected features
+
+        # Edge-guided modulation: amplify projected features at thermal edges
+        f_mod = e * p              # (B, C, H, W)
+
+        # Frequency-aware channel gating: suppress noise channels
+        w_ch = self.gate(f_mod)    # (B, C, 1, 1)
+
+        # Gated residual output
+        return x + w_ch * f_mod
+
+
+        
